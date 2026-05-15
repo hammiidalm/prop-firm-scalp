@@ -23,7 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 
-from app.api.routes import health, risk, stats, trades
+from app.api.routes import health, risk, settings, stats, status, trades
 from app.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -43,6 +43,7 @@ def create_app(
     journal: Any = None,
     stats_aggregator: Any = None,
     ws_client: Any = None,
+    engine: Any = None,
 ) -> FastAPI:
     """Build the FastAPI instance with injected dependencies."""
     app = FastAPI(
@@ -66,11 +67,14 @@ def create_app(
     app.state.journal = journal
     app.state.stats_aggregator = stats_aggregator
     app.state.ws_client = ws_client
+    app.state.engine = engine
 
     # Register routers
     app.include_router(health.router)
     app.include_router(risk.router, prefix="/api/v1")
     app.include_router(trades.router, prefix="/api/v1")
     app.include_router(stats.router, prefix="/api/v1")
+    app.include_router(status.router, prefix="/api/v1")
+    app.include_router(settings.router, prefix="/api/v1")
 
     return app

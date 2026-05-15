@@ -109,6 +109,27 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     discord_webhook_url: SecretStr = SecretStr("")
 
+    # ---- telegram bot (interactive) --------------------------------------
+    admin_chat_ids: list[int] = Field(default_factory=list)
+
+    @field_validator("admin_chat_ids", mode="before")
+    @classmethod
+    def _split_admin_ids(cls, v: object) -> list[int]:
+        """Parse comma-separated chat IDs from env (e.g. '123,456').
+
+        Falls back to ``telegram_chat_id`` if empty (handled in
+        ``get_admin_chat_ids``).
+        """
+        if isinstance(v, str):
+            if not v.strip():
+                return []
+            return [int(x.strip()) for x in v.split(",") if x.strip()]
+        if isinstance(v, list):
+            return [int(x) for x in v]
+        if isinstance(v, int):
+            return [v]
+        return []
+
     # ---- validators ------------------------------------------------------
     @field_validator("symbols", mode="before")
     @classmethod
@@ -142,6 +163,27 @@ class Settings(BaseSettings):
 
     def is_discord_enabled(self) -> bool:
         return bool(self.discord_webhook_url.get_secret_value())
+
+    def get_admin_chat_ids(self) -> list[int]:
+        """Return the resolved list of authorized Telegram chat IDs.
+
+        Priority: ``admin_chat_ids`` env var. If empty, falls back to
+        ``telegram_chat_id`` (the single notification recipient).
+        """
+        if self.admin_chat_ids:
+            return self.admin_chat_ids
+        if self.telegram_chat_id:
+            try:
+                return [int(self.telegram_chat_id)]
+            except ValueError:
+                return []
+        return []
+
+    def is_telegram_bot_enabled(self) -> bool:
+        """True if we have both a token and at least one authorized chat ID."""
+        return bool(
+            self.telegram_bot_token.get_secret_value() and self.get_admin_chat_ids()
+        )
 
 
 @lru_cache(maxsize=1)

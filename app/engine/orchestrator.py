@@ -147,6 +147,7 @@ class Engine:
             journal=self._journal,
             stats_aggregator=self._stats,
             ws_client=self._ws,
+            engine=self,
         )
         config = uvicorn.Config(
             app,
@@ -201,6 +202,120 @@ class Engine:
         if self._journal:
             await self._journal.close()
         log.info("engine stopped")
+
+    # ==================================================================
+    # Hot-reload: environment switching
+    # ==================================================================
+
+    async def switch_environment(self, target_mode: str) -> bool:
+        """Switch the trading environment at runtime without container restart.
+
+        Steps:
+        1. Stop WebSocket streaming (if active).
+        2. Close current broker connection.
+        3. Update in-memory settings to the new mode.
+        4. Instantiate and connect the new broker.
+        5. Re-create the risk manager with fresh balance from the new broker.
+        6. Re-wire the executor with the new broker + risk manager.
+        7. Restart WebSocket if the new mode requires it.
+
+        Returns True on success, False on failure (reverts on error).
+        """
+        from app.config.settings import TradingMode
+
+        old_mode = self._settings.app_mode
+        try:
+            new_mode = TradingMode(target_mode)
+        except ValueError:
+            log.error("invalid trading mode: %s", target_mode)
+            return False
+
+        if new_mode == old_mode:
+            log.info("switch_environment: already in mode %s", new_mode.value)
+            return True
+
+        log.info(
+            "switching environment",
+            extra={"from": old_mode.value, "to": new_mode.value},
+        )
+
+        # --- 1. Stop WS ---
+        if self._ws:
+            await self._ws.stop()
+            self._ws = None
+            log.info("ws stopped for environment switch")
+
+        # --- 2. Close old broker ---
+        old_broker = self._broker
+        if old_broker:
+            try:
+                await old_broker.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("error closing old broker: %s", exc)
+
+        # --- 3. Update settings in-memory ---
+        self._settings.app_mode = new_mode
+
+        # --- 4. Connect new broker ---
+        try:
+            if new_mode is TradingMode.paper:
+                self._broker = PaperBroker(starting_balance=self._settings.account_balance)
+            else:
+                self._broker = TradeLockerClient(self._settings)
+            await self._broker.connect()
+        except Exception as exc:
+            log.exception("failed to connect new broker, reverting: %s", exc)
+            # Revert
+            self._settings.app_mode = old_mode
+            if old_broker:
+                try:
+                    await old_broker.connect()
+                    self._broker = old_broker
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
+
+        # --- 5. Refresh risk manager with new balance ---
+        try:
+            balance = await self._broker.get_account_balance()
+        except Exception:  # noqa: BLE001
+            balance = self._settings.account_balance
+
+        self._risk = RiskManager(
+            settings=self._settings,
+            starting_balance=balance,
+            current_balance=balance,
+            high_water_mark=balance,
+        )
+
+        # --- 6. Re-wire executor ---
+        self._executor = Executor(
+            broker=self._broker,
+            risk=self._risk,
+            mode=new_mode,
+            notify=self._notifier.notify if self._notifier else None,
+            persist_trade=self._persist_trade,
+        )
+
+        # --- 7. Restart WS if needed ---
+        if new_mode is not TradingMode.paper and isinstance(self._broker, TradeLockerClient):
+            self._ws = WebSocketClient(
+                url=self._settings.tl_ws_url,
+                token_provider=self._get_ws_token,
+                on_message=self._on_ws_message,
+            )
+            await self._ws.start()
+            log.info("ws restarted for new environment")
+
+        # Update stats aggregator starting balance
+        if self._stats:
+            self._stats = TradeStatsAggregator(starting_balance=balance)
+
+        log.info(
+            "environment switch complete",
+            extra={"mode": new_mode.value, "balance": balance},
+        )
+        return True
 
     # ==================================================================
     # Internal handlers
