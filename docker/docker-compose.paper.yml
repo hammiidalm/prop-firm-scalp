@@ -1,0 +1,17 @@
+# =============================================================================
+# Paper-trading override - uses SQLite only, no Postgres/Redis required.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker/docker-compose.paper.yml up
+# =============================================================================
+
+services:
+  bot:
+    environment:
+      APP_MODE: paper
+      DATABASE_URL: "sqlite+aiosqlite:///./data/journal.db"
+    depends_on: []
+
+  # Disable postgres for paper mode
+  postgres:
+    profiles: ["disabled"]
