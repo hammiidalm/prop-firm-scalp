@@ -37,6 +37,7 @@ from typing import Literal
 
 from app.models import Candle, CandleSeries, Signal
 from app.strategy.candles import is_strong_bearish_rejection, is_strong_bullish_rejection
+from app.strategy.confluence import SignalConfluence
 from app.strategy.market_structure import (
     HTFBias,
     MarketStructure,
@@ -189,12 +190,20 @@ class SmcScalpStrategy:
 
         The method returns early (None) if any hard-block is hit; otherwise
         it accumulates a confluence score and fires only if ≥ threshold.
+        Every rejection is logged with full ``SignalConfluence`` detail.
         """
         assert self._ms is not None and self._instrument is not None
 
         # ---- Hard-block: HTF must not be bearish -------------------------
-        # We allow NEUTRAL (no HTF data yet) + BULLISH.
         if htf_bias is HTFBias.BEARISH:
+            self._log_rejection(
+                SignalConfluence.rejected(
+                    direction="LONG",
+                    htf_bias=htf_bias.value,
+                    reason="HTF_BIAS_OPPOSED",
+                ),
+                candle,
+            )
             return None
 
         # ---- Check if a SWEEP_LOW occurred this bar ----------------------
@@ -202,22 +211,21 @@ class SmcScalpStrategy:
             (e for e in events if e.kind is StructureKind.SWEEP_LOW), None
         )
         if sweep_event is None:
-            return None  # no liquidity sweep → nothing to trade
+            return None  # no liquidity sweep → nothing to evaluate
 
         # ==================================================================
-        # Confluence scoring begins
+        # Confluence scoring
         # ==================================================================
-        score = 0
-        tags: list[str] = []
-
-        # ---- Factor 1: Liquidity Sweep (40 pts) --------------------------
-        # Already confirmed above — award full points.
-        score += _SCORE_SWEEP
-        tags.append("SWEEP_LOW")
+        sweep_pts = _SCORE_SWEEP
+        rejection_pts = 0
+        bos_htf_pts = 0
+        ob_pts = 0
+        session_pts = _SCORE_SESSION_SPREAD
+        tags: list[str] = ["SWEEP_LOW"]
 
         # ---- Factor 2: Strong Rejection Candle (25 pts) ------------------
         if is_strong_bullish_rejection(candle):
-            score += _SCORE_REJECTION
+            rejection_pts = _SCORE_REJECTION
             tags.append("REJECTION_BULL")
 
         # ---- Factor 3: BOS/CHOCH aligned with HTF (20 pts) ---------------
@@ -228,49 +236,69 @@ class SmcScalpStrategy:
             or self._ms.last_trend() is StructureKind.BOS_BULL
         )
         if bos_aligned and htf_bias is HTFBias.BULLISH:
-            score += _SCORE_BOS_HTF
+            bos_htf_pts = _SCORE_BOS_HTF
             tags.append("BOS_HTF_ALIGNED")
         elif bos_aligned:
-            # HTF is NEUTRAL — partial credit (half)
-            score += _SCORE_BOS_HTF // 2
+            bos_htf_pts = _SCORE_BOS_HTF // 2
             tags.append("BOS_NEUTRAL_HTF")
 
         # ---- Factor 4: Order Block proximity (10 pts) --------------------
         entry_price = candle.close
         ob_hit = self._price_in_order_block(entry_price, "BULLISH")
         if ob_hit is not None:
-            score += _SCORE_ORDER_BLOCK
+            ob_pts = _SCORE_ORDER_BLOCK
             tags.append("OB_DEMAND")
 
         # ---- Factor 5: Session + Spread pass (5 pts) ---------------------
-        # Session is already confirmed (hard-block above); the spread check
-        # is delegated to the execution layer, but we award the 5 pts here
-        # since the session is active.
-        score += _SCORE_SESSION_SPREAD
         tags.append("SESSION_OK")
 
-        # ---- Bonus: FVG alignment (informational, no extra points but
-        #      logged for the journal) ------------------------------------
+        # ---- Bonus: FVG (informational tag for journal) ------------------
         fvgs = self._ms.find_fvg(direction="BULLISH", active_only=True)
         if any(fvg.gap_low <= entry_price <= fvg.gap_high for fvg in fvgs):
             tags.append("FVG_BULLISH")
 
+        # ---- Build confluence record -------------------------------------
+        total = sweep_pts + rejection_pts + bos_htf_pts + ob_pts + session_pts
+        factors_hit = sum(1 for v in [sweep_pts, rejection_pts, bos_htf_pts, ob_pts, session_pts] if v > 0)
+
         # ==================================================================
         # Gate: minimum confluence
         # ==================================================================
-        if score < self.min_confluence:
-            log.debug(
-                "LONG rejected: confluence %d < %d",
-                score, self.min_confluence,
-                extra={"symbol": self.symbol, "score": score, "tags": tags},
+        if total < self.min_confluence:
+            confluence = SignalConfluence(
+                score=total,
+                factors_hit=factors_hit,
+                sweep=sweep_pts,
+                rejection=rejection_pts,
+                bos_htf=bos_htf_pts,
+                order_block=ob_pts,
+                session_spread=session_pts,
+                direction="LONG",
+                htf_bias=htf_bias.value,
+                tags=tags,
+                rejection_reason=f"CONFLUENCE_LOW ({total}<{self.min_confluence})",
             )
+            self._log_rejection(confluence, candle)
             return None
 
         # ==================================================================
-        # Build the signal
+        # Build the signal (accepted)
         # ==================================================================
+        confluence = SignalConfluence(
+            score=total,
+            factors_hit=factors_hit,
+            sweep=sweep_pts,
+            rejection=rejection_pts,
+            bos_htf=bos_htf_pts,
+            order_block=ob_pts,
+            session_spread=session_pts,
+            direction="LONG",
+            htf_bias=htf_bias.value,
+            tags=tags,
+        )
+
         swept_low = sweep_event.reference_swing.price
-        signal = self._build_signal_long(candle, swept_low, score, tags)
+        signal = self._build_signal_long(candle, swept_low, confluence)
         if signal is None:
             return None
 
@@ -279,7 +307,8 @@ class SmcScalpStrategy:
             "LONG signal fired",
             extra={
                 "symbol": self.symbol,
-                "confluence": score,
+                "confluence": confluence.factors_summary,
+                "score": total,
                 "rr": signal.rr_ratio,
                 "tags": tags,
             },
@@ -299,11 +328,20 @@ class SmcScalpStrategy:
         """Score and (optionally) generate a SHORT signal.
 
         Mirror of ``_evaluate_long`` with inverted direction logic.
+        Every rejection is logged with full ``SignalConfluence`` detail.
         """
         assert self._ms is not None and self._instrument is not None
 
         # ---- Hard-block: HTF must not be bullish -------------------------
         if htf_bias is HTFBias.BULLISH:
+            self._log_rejection(
+                SignalConfluence.rejected(
+                    direction="SHORT",
+                    htf_bias=htf_bias.value,
+                    reason="HTF_BIAS_OPPOSED",
+                ),
+                candle,
+            )
             return None
 
         # ---- Check if a SWEEP_HIGH occurred this bar ---------------------
@@ -314,18 +352,18 @@ class SmcScalpStrategy:
             return None
 
         # ==================================================================
-        # Confluence scoring begins
+        # Confluence scoring
         # ==================================================================
-        score = 0
-        tags: list[str] = []
-
-        # ---- Factor 1: Liquidity Sweep (40 pts) --------------------------
-        score += _SCORE_SWEEP
-        tags.append("SWEEP_HIGH")
+        sweep_pts = _SCORE_SWEEP
+        rejection_pts = 0
+        bos_htf_pts = 0
+        ob_pts = 0
+        session_pts = _SCORE_SESSION_SPREAD
+        tags: list[str] = ["SWEEP_HIGH"]
 
         # ---- Factor 2: Strong Rejection Candle (25 pts) ------------------
         if is_strong_bearish_rejection(candle):
-            score += _SCORE_REJECTION
+            rejection_pts = _SCORE_REJECTION
             tags.append("REJECTION_BEAR")
 
         # ---- Factor 3: BOS/CHOCH aligned with HTF (20 pts) ---------------
@@ -336,44 +374,69 @@ class SmcScalpStrategy:
             or self._ms.last_trend() is StructureKind.BOS_BEAR
         )
         if bos_aligned and htf_bias is HTFBias.BEARISH:
-            score += _SCORE_BOS_HTF
+            bos_htf_pts = _SCORE_BOS_HTF
             tags.append("BOS_HTF_ALIGNED")
         elif bos_aligned:
-            score += _SCORE_BOS_HTF // 2
+            bos_htf_pts = _SCORE_BOS_HTF // 2
             tags.append("BOS_NEUTRAL_HTF")
 
         # ---- Factor 4: Order Block proximity (10 pts) --------------------
         entry_price = candle.close
         ob_hit = self._price_in_order_block(entry_price, "BEARISH")
         if ob_hit is not None:
-            score += _SCORE_ORDER_BLOCK
+            ob_pts = _SCORE_ORDER_BLOCK
             tags.append("OB_SUPPLY")
 
         # ---- Factor 5: Session + Spread pass (5 pts) ---------------------
-        score += _SCORE_SESSION_SPREAD
         tags.append("SESSION_OK")
 
-        # ---- Bonus: FVG alignment ----------------------------------------
+        # ---- Bonus: FVG (informational) ----------------------------------
         fvgs = self._ms.find_fvg(direction="BEARISH", active_only=True)
         if any(fvg.gap_low <= entry_price <= fvg.gap_high for fvg in fvgs):
             tags.append("FVG_BEARISH")
 
+        # ---- Build confluence record -------------------------------------
+        total = sweep_pts + rejection_pts + bos_htf_pts + ob_pts + session_pts
+        factors_hit = sum(1 for v in [sweep_pts, rejection_pts, bos_htf_pts, ob_pts, session_pts] if v > 0)
+
         # ==================================================================
         # Gate: minimum confluence
         # ==================================================================
-        if score < self.min_confluence:
-            log.debug(
-                "SHORT rejected: confluence %d < %d",
-                score, self.min_confluence,
-                extra={"symbol": self.symbol, "score": score, "tags": tags},
+        if total < self.min_confluence:
+            confluence = SignalConfluence(
+                score=total,
+                factors_hit=factors_hit,
+                sweep=sweep_pts,
+                rejection=rejection_pts,
+                bos_htf=bos_htf_pts,
+                order_block=ob_pts,
+                session_spread=session_pts,
+                direction="SHORT",
+                htf_bias=htf_bias.value,
+                tags=tags,
+                rejection_reason=f"CONFLUENCE_LOW ({total}<{self.min_confluence})",
             )
+            self._log_rejection(confluence, candle)
             return None
 
         # ==================================================================
-        # Build the signal
+        # Build the signal (accepted)
         # ==================================================================
+        confluence = SignalConfluence(
+            score=total,
+            factors_hit=factors_hit,
+            sweep=sweep_pts,
+            rejection=rejection_pts,
+            bos_htf=bos_htf_pts,
+            order_block=ob_pts,
+            session_spread=session_pts,
+            direction="SHORT",
+            htf_bias=htf_bias.value,
+            tags=tags,
+        )
+
         swept_high = sweep_event.reference_swing.price
-        signal = self._build_signal_short(candle, swept_high, score, tags)
+        signal = self._build_signal_short(candle, swept_high, confluence)
         if signal is None:
             return None
 
@@ -382,7 +445,8 @@ class SmcScalpStrategy:
             "SHORT signal fired",
             extra={
                 "symbol": self.symbol,
-                "confluence": score,
+                "confluence": confluence.factors_summary,
+                "score": total,
                 "rr": signal.rr_ratio,
                 "tags": tags,
             },
@@ -397,17 +461,14 @@ class SmcScalpStrategy:
         self,
         candle: Candle,
         swept_low: float,
-        confluence: int,
-        tags: list[str],
+        confluence: SignalConfluence,
     ) -> Signal | None:
         """Construct a LONG Signal with proper SL/TP or None if RR < min."""
         assert self._instrument is not None
 
         entry = candle.close
-        # SL below the swept low with 1-pip buffer
         sl = min(swept_low, candle.low) - self._instrument.price_delta(1.0)
 
-        # TP: at least min_rr × risk, capped by target_profit_pct_max
         risk_dist = entry - sl
         if risk_dist <= 0:
             return None
@@ -417,10 +478,13 @@ class SmcScalpStrategy:
         tp_dist = min(tp_dist, entry * self.target_profit_pct_max * 1.5)
         tp = entry + tp_dist
 
-        # Confidence = confluence score normalized to 0.0–1.0
-        confidence = min(confluence / 100.0, 1.0)
+        confidence = min(confluence.score / 100.0, 1.0)
+        reason = f"sweep_low+rejection confluence={confluence.factors_summary}"
 
-        reason = f"sweep_low+rejection confluence={confluence}"
+        # Embed confluence breakdown in structure_tags for journal/notifier
+        tags = list(confluence.tags)
+        tags.append(f"CONFLUENCE:{confluence.score}")
+
         sig = Signal.long(
             symbol=self.symbol,
             timeframe=self.timeframe,
@@ -441,14 +505,12 @@ class SmcScalpStrategy:
         self,
         candle: Candle,
         swept_high: float,
-        confluence: int,
-        tags: list[str],
+        confluence: SignalConfluence,
     ) -> Signal | None:
         """Construct a SHORT Signal with proper SL/TP or None if RR < min."""
         assert self._instrument is not None
 
         entry = candle.close
-        # SL above the swept high with 1-pip buffer
         sl = max(swept_high, candle.high) + self._instrument.price_delta(1.0)
 
         risk_dist = sl - entry
@@ -460,9 +522,12 @@ class SmcScalpStrategy:
         tp_dist = min(tp_dist, entry * self.target_profit_pct_max * 1.5)
         tp = entry - tp_dist
 
-        confidence = min(confluence / 100.0, 1.0)
+        confidence = min(confluence.score / 100.0, 1.0)
+        reason = f"sweep_high+rejection confluence={confluence.factors_summary}"
 
-        reason = f"sweep_high+rejection confluence={confluence}"
+        tags = list(confluence.tags)
+        tags.append(f"CONFLUENCE:{confluence.score}")
+
         sig = Signal.short(
             symbol=self.symbol,
             timeframe=self.timeframe,
@@ -478,6 +543,38 @@ class SmcScalpStrategy:
         if sig.rr_ratio < self.min_rr:
             return None
         return sig
+
+    # ==================================================================
+    # Rejection logging
+    # ==================================================================
+
+    def _log_rejection(self, confluence: SignalConfluence, candle: Candle) -> None:
+        """Emit a structured log entry for every rejected signal evaluation.
+
+        This is critical for strategy improvement — by analyzing which
+        factors are consistently missing, the trader can tune parameters
+        or identify market-regime mismatches.
+        """
+        log.info(
+            "signal_rejected",
+            extra={
+                "symbol": self.symbol,
+                "direction": confluence.direction,
+                "timestamp": str(candle.timestamp),
+                "price": candle.close,
+                "rejection_reason": confluence.rejection_reason,
+                "score": confluence.score,
+                "factors_hit": confluence.factors_hit,
+                "factors_total": confluence.factors_total,
+                "htf_bias": confluence.htf_bias,
+                "sweep_pts": confluence.sweep,
+                "rejection_pts": confluence.rejection,
+                "bos_htf_pts": confluence.bos_htf,
+                "ob_pts": confluence.order_block,
+                "session_pts": confluence.session_spread,
+                "tags": confluence.tags,
+            },
+        )
 
     # ==================================================================
     # Helpers

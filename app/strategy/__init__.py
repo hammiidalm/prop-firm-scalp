@@ -1,6 +1,7 @@
 """Strategy package: market-structure analysis + signal generation."""
 
 from app.strategy.base import Strategy
+from app.strategy.confluence import SignalConfluence
 from app.strategy.market_structure import (
     FairValueGap,
     HTFBias,
@@ -20,6 +21,7 @@ __all__ = [
     "HTFStructure",
     "MarketStructure",
     "OrderBlock",
+    "SignalConfluence",
     "SmcScalpStrategy",
     "Strategy",
     "StructureEvent",
