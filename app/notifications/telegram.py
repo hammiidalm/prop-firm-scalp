@@ -78,6 +78,20 @@ class TelegramNotifier:
         rr = p.get("rr_ratio", "?")
         session = p.get("session", "?")
         emoji = "🟢" if direction == "LONG" else "🔴"
+
+        # Extract confluence info from structure_tags or reason
+        tags = p.get("structure_state", {}).get("tags", [])
+        if isinstance(tags, list):
+            confluence_tag = next((t for t in tags if t.startswith("CONFLUENCE:")), None)
+        else:
+            confluence_tag = None
+        confluence_score = confluence_tag.split(":")[1] if confluence_tag else "?"
+        # Count factors (tags that aren't CONFLUENCE:xx or SESSION_OK)
+        factor_tags = [t for t in (tags if isinstance(tags, list) else [])
+                       if not t.startswith("CONFLUENCE:")]
+        factors_hit = len([t for t in factor_tags
+                          if t not in ("SESSION_OK",) and "FVG" not in t])
+
         lines = [
             f"{emoji} *TRADE OPENED*",
             f"Symbol: `{symbol}`",
@@ -85,6 +99,7 @@ class TelegramNotifier:
             f"Entry: `{entry}`",
             f"SL: `{sl}` \\| TP: `{tp}`",
             f"Lots: `{lots}` \\| RR: `{rr}`",
+            f"Confluence: `{confluence_score}/100` • `{factors_hit}/5 factors`",
             f"Session: `{session}`",
         ]
         return "\n".join(self._escape_line(l) for l in lines)
