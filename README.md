@@ -10,15 +10,15 @@ Built for disciplined traders who prioritize **capital preservation**, **low dra
 
 | Category | Details |
 |----------|---------|
-| **Strategy** | Smart-Money Concepts: BOS, CHOCH, liquidity sweeps, rejection candles, displacement detection |
+| **Strategy** | SMC v2: HTF Bias filter, Order Blocks, FVG, liquidity sweeps, BOS/CHOCH, rejection candles, dynamic confluence scoring (0–100) |
 | **Risk** | 0.25-0.5% per trade, 1% daily DD cap, 3-loss circuit breaker, 5 trades/day max |
 | **Broker** | TradeLocker REST + WebSocket, JWT auto-refresh, order retry with backoff |
 | **Symbols** | EURUSD and XAUUSD optimized (extensible to any TradeLocker symbol) |
 | **Modes** | Paper trading, Semi-auto (Telegram confirmation), Full-auto |
 | **Sessions** | London (07-11 UTC) and New York (12-16 UTC) only |
 | **Infra** | Docker, systemd, PostgreSQL/SQLite, optional Redis, FastAPI dashboard |
-| **Alerts** | Telegram (MarkdownV2) + Discord webhooks |
-| **Analytics** | Backtesting engine, equity curve, winrate, session stats |
+| **Alerts** | Telegram (MarkdownV2 with confluence display) + Discord webhooks |
+| **Analytics** | Backtesting engine, equity curve, winrate, session stats, rejection analysis |
 
 ---
 
@@ -171,25 +171,136 @@ Signals approved by the risk manager are sent directly to TradeLocker. The bot m
 
 ---
 
-## Strategy: SMC Scalp
+## Strategy: SMC Scalp v2 — Confluence-Scored
 
-The strategy implements institutional Smart Money Concepts:
+The strategy implements institutional **Smart Money Concepts** with a multi-timeframe,
+confluence-based approach. A signal is only generated when sufficient evidence aligns —
+no single-factor entries.
 
-**LONG Entry:**
-1. Liquidity sweep below a recent swing low (stop hunt)
-2. Strong bullish rejection candle (long lower wick, small body)
-3. Minor bullish BOS or CHOCH confirmation
-4. Market order at close of confirmation bar
-5. Stop loss just below the sweep low (-1 pip buffer)
-6. Take profit sized for 0.1%-0.2% account equity gain
+### Core Concepts
 
-**SHORT Entry:** (mirror of above)
+| Concept | Description |
+|---------|-------------|
+| **Higher-Timeframe Bias** | A separate `HTFStructure` tracker (M15/H1) determines the prevailing directional trend. Entries *against* the HTF bias are hard-blocked. |
+| **Liquidity Sweep** | Price wicks through a swing high/low but closes back inside — a classic stop-hunt that precedes institutional reversals. |
+| **Order Block (OB)** | The last opposing candle before a displacement move that broke structure. Marks institutional supply/demand zones. |
+| **Fair Value Gap (FVG)** | A 3-candle imbalance where price left an unfilled gap. Acts as a magnet for price retracement. |
+| **BOS / CHOCH** | Break of Structure (trend continuation) and Change of Character (trend reversal) confirmed only on candle *close*. |
+| **Adaptive Swing Detection** | Swing points must exceed an ATR-scaled prominence threshold — suppresses noise in volatile conditions. |
 
-**Filters:**
-- Only trades during London (07-11 UTC) or New York (12-16 UTC)
-- Spread must be below configured cap
-- Minimum R:R of 1.2:1
-- One signal per bar per symbol
+### Dynamic Confluence Scoring (0–100)
+
+Every potential entry is scored across 5 independent factors. **Only signals scoring ≥ 75 are accepted.**
+
+```
+┌───────────────────────────────────────┬────────┐
+│ Factor                                │ Points │
+├───────────────────────────────────────┼────────┤
+│ 1. Liquidity Sweep (stop-hunt)        │   40   │
+│ 2. Strong Rejection Candle            │   25   │
+│ 3. BOS/CHOCH aligned with HTF bias    │   20   │
+│ 4. Order Block proximity (at entry)   │   10   │
+│ 5. Session active + Spread OK         │    5   │
+├───────────────────────────────────────┼────────┤
+│ TOTAL POSSIBLE                        │  100   │
+│ MINIMUM TO FIRE                       │   75   │
+└───────────────────────────────────────┴────────┘
+```
+
+The confluence score is:
+- Logged in structured JSON for every accepted AND rejected signal
+- Displayed in Telegram notifications: `Confluence: 82/100 • 4/5 factors`
+- Stored in the trade journal via `SignalConfluence` dataclass
+- Normalized to `Signal.confidence` (0.0–1.0) for downstream layers
+
+### Entry Rules: LONG
+
+```
+Prerequisites (hard-blocks — instant reject):
+  ✗ HTF bias is BEARISH → blocked
+  ✗ Outside London/NY session → blocked
+  ✗ No SWEEP_LOW event on this bar → skip
+
+Scoring:
+  ✓ Liquidity sweep below swing low                     → +40 pts
+  ✓ Bullish rejection candle (long lower wick, small body) → +25 pts
+  ✓ BOS_BULL or CHOCH_BULL + HTF BULLISH               → +20 pts
+    (BOS + HTF NEUTRAL → +10 pts partial credit)
+  ✓ Entry price inside an active Bullish Order Block    → +10 pts
+  ✓ Session active                                      → +5 pts
+  ◎ Entry inside Bullish FVG                            → tag only (journal)
+
+Gate: score ≥ 75 → BUILD SIGNAL
+  • Entry: candle close
+  • SL: min(swept_low, candle.low) − 1 pip
+  • TP: max(target_profit_pct × entry, min_rr × risk)
+  • Final check: RR ≥ 1.2 or reject
+```
+
+### Entry Rules: SHORT
+
+```
+Prerequisites (hard-blocks — instant reject):
+  ✗ HTF bias is BULLISH → blocked
+  ✗ Outside London/NY session → blocked
+  ✗ No SWEEP_HIGH event on this bar → skip
+
+Scoring:
+  ✓ Liquidity sweep above swing high                    → +40 pts
+  ✓ Bearish rejection candle (long upper wick, small body) → +25 pts
+  ✓ BOS_BEAR or CHOCH_BEAR + HTF BEARISH               → +20 pts
+    (BOS + HTF NEUTRAL → +10 pts partial credit)
+  ✓ Entry price inside an active Bearish Order Block    → +10 pts
+  ✓ Session active                                      → +5 pts
+  ◎ Entry inside Bearish FVG                            → tag only (journal)
+
+Gate: score ≥ 75 → BUILD SIGNAL
+  • Entry: candle close
+  • SL: max(swept_high, candle.high) + 1 pip
+  • TP: max(target_profit_pct × entry, min_rr × risk)
+  • Final check: RR ≥ 1.2 or reject
+```
+
+### HTF Bias Integration
+
+```python
+# Engine wires it like this:
+htf_tracker = HTFStructure(swing_lookback=3)  # one per symbol, on M15
+
+# Whenever a new M15 bar closes:
+htf_tracker.update(m15_candle)
+strategy.set_htf_bias(htf_tracker.bias)  # inject into execution-TF strategy
+```
+
+The HTF bias is derived from the most recent BOS/CHOCH on the higher timeframe:
+- Last HTF event was `BOS_BULL` or `CHOCH_BULL` → **BULLISH**
+- Last HTF event was `BOS_BEAR` or `CHOCH_BEAR` → **BEARISH**
+- No conclusive event yet → **NEUTRAL** (both directions allowed)
+
+### Rejection Logging (for Strategy Improvement)
+
+Every rejected signal evaluation is logged in structured JSON:
+
+```json
+{
+  "message": "signal_rejected",
+  "symbol": "EURUSD",
+  "direction": "LONG",
+  "rejection_reason": "CONFLUENCE_LOW (45<75)",
+  "score": 45,
+  "factors_hit": 2,
+  "factors_total": 5,
+  "sweep_pts": 40,
+  "rejection_pts": 0,
+  "bos_htf_pts": 0,
+  "ob_pts": 0,
+  "session_pts": 5,
+  "tags": ["SWEEP_LOW", "SESSION_OK"]
+}
+```
+
+This enables post-session analysis: which factors are consistently missing?
+Should `min_confluence` be lowered? Is the HTF bias too strict?
 
 ---
 
