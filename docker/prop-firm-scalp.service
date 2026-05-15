@@ -1,0 +1,44 @@
+# =============================================================================
+# systemd service unit for prop-firm-scalp
+#
+# Install:
+#   sudo cp docker/prop-firm-scalp.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now prop-firm-scalp
+#
+# Compatible with Oracle Linux 8/9, RHEL 8/9, Fedora, Ubuntu 22.04+
+# =============================================================================
+
+[Unit]
+Description=PropFirm Scalping Bot (TradeLocker)
+Documentation=https://github.com/hammiidalm/prop-firm-scalp
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/prop-firm-scalp
+ExecStartPre=/usr/bin/docker compose pull --quiet
+ExecStart=/usr/bin/docker compose up --remove-orphans
+ExecStop=/usr/bin/docker compose down --timeout 30
+ExecReload=/usr/bin/docker compose restart bot
+
+# Restart policy: always restart on failure, with increasing backoff
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/prop-firm-scalp
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=prop-firm-scalp
+
+[Install]
+WantedBy=multi-user.target

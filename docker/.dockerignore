@@ -1,0 +1,20 @@
+# Docker build context exclusions
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+.env
+.env.*
+!.env.example
+data/
+logs/
+*.db
+.mypy_cache
+.ruff_cache
+.pytest_cache
+tests/
+docs/
+*.md
+!README.md
