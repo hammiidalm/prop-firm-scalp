@@ -112,6 +112,9 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8080
 
+    # ---- market data source -----------------------------------------------
+    finnhub_api_key: SecretStr = SecretStr("")  # If set, uses Finnhub.io instead of TradeLocker REST for price data
+
     # ---- notifications ---------------------------------------------------
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
