@@ -22,7 +22,7 @@ Usage example (see ``scripts/run_backtest.py`` for a full script):
 
 from __future__ import annotations
 
-import asyncio
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -180,6 +180,9 @@ class BacktestEngine:
             ask = candle.close + half_spread
             self._broker.set_quote(candle.symbol, bid, ask)
 
+            # Sync risk manager clock to candle timestamp
+            risk.set_simulated_time(candle.timestamp)
+
             # Check if any open trades should be closed (SL/TP hit)
             await self._check_sl_tp(executor, candle)
 
@@ -215,8 +218,8 @@ class BacktestEngine:
             max_drawdown_pct=self._stats.max_drawdown,
             total_bars=total_bars,
             duration_sec=duration,
-            by_session={k: v.__dict__ for k, v in self._stats.by_session.items()},
-            by_symbol={k: v.__dict__ for k, v in self._stats.by_symbol.items()},
+            by_session={k: dataclasses.asdict(v) for k, v in self._stats.by_session.items()},
+            by_symbol={k: dataclasses.asdict(v) for k, v in self._stats.by_symbol.items()},
         )
 
     async def _check_sl_tp(self, executor: Executor, candle: Candle) -> None:

@@ -42,6 +42,12 @@ class Timeframe(str, Enum):
     H4 = "H4"
     D1 = "D1"
 
+    def to_seconds(self) -> int:
+        """Convert Timeframe to seconds."""
+        m = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+             "H1": 3600, "H4": 14400, "D1": 86400}
+        return m[self.value]
+
 
 Pct = Annotated[float, Field(ge=0.0, le=1.0)]
 
@@ -79,8 +85,8 @@ class Settings(BaseSettings):
 
     # ---- risk -------------------------------------------------------------
     account_balance: float = 100_000.0
-    risk_per_trade_pct: Pct = 0.0035
-    max_daily_loss_pct: Pct = 0.01
+    risk_per_trade_pct: Pct = 0.01
+    max_daily_loss_pct: Pct = 0.03
     max_total_dd_pct: Pct = 0.05
     max_trades_per_day: int = Field(default=5, ge=1, le=50)
     max_consecutive_losses: int = Field(default=3, ge=1, le=10)
@@ -89,6 +95,8 @@ class Settings(BaseSettings):
     max_spread_pips_fx: float = 1.5
     max_spread_pips_metals: float = 35.0
     max_slippage_pips: float = 2.0
+    min_trading_days: int = Field(default=7, ge=1, le=365)
+    consistency_pct: Pct = 0.15
 
     # ---- sessions (UTC) ---------------------------------------------------
     london_open_utc: int = Field(default=7, ge=0, le=23)
@@ -151,6 +159,22 @@ class Settings(BaseSettings):
         return v
 
     # ---- convenience -----------------------------------------------------
+    @property
+    def symbol_timeframe_map(self) -> dict[str, str]:
+        """Parse symbols list into dict[symbol -> timeframe].
+
+        Entries can be "SYMBOL:TF" (e.g. "EURUSD:M1") or just "SYMBOL"
+        (defaults to primary_timeframe for backward compat).
+        """
+        result: dict[str, str] = {}
+        for entry in self.symbols:
+            if ":" in entry:
+                sym, tf = entry.split(":", 1)
+                result[sym.strip()] = tf.strip()
+            else:
+                result[entry] = self.primary_timeframe.value
+        return result
+
     def risk_per_trade_amount(self) -> float:
         """Absolute risk in account currency for the configured balance."""
         return self.account_balance * self.risk_per_trade_pct

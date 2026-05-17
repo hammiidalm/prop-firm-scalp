@@ -57,6 +57,21 @@ _REGISTRY: dict[str, Instrument] = {
         quote_per_pip_per_lot=10.0,
         is_metal=True,
     ),
+    # Crypto — 24/7 markets, different pip conventions
+    "BTCUSD": Instrument(
+        symbol="BTCUSD",
+        pip_size=1.0,
+        contract_size=1,
+        quote_per_pip_per_lot=1.0,
+        is_metal=False,
+    ),
+    "ETHUSD": Instrument(
+        symbol="ETHUSD",
+        pip_size=0.10,
+        contract_size=1,
+        quote_per_pip_per_lot=1.0,
+        is_metal=False,
+    ),
 }
 
 

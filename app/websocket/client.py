@@ -98,7 +98,7 @@ class WebSocketClient:
                 headers = [("Authorization", f"Bearer {token}")]
                 async with websockets.connect(
                     self._url,
-                    extra_headers=headers,
+                    additional_headers=headers,
                     ping_interval=self._ping_interval,
                     ping_timeout=self._ping_timeout,
                     close_timeout=5.0,

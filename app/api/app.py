@@ -23,7 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 
-from app.api.routes import health, risk, settings, stats, status, trades
+from app.api.routes import health, risk, settings, signals, stats, status, trades, market
 from app.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -76,5 +76,7 @@ def create_app(
     app.include_router(stats.router, prefix="/api/v1")
     app.include_router(status.router, prefix="/api/v1")
     app.include_router(settings.router, prefix="/api/v1")
+    app.include_router(signals.router, prefix="/api/v1")
+    app.include_router(market.router, prefix="/api/v1")
 
     return app

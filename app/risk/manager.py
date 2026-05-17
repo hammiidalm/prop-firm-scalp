@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from enum import Enum
 
 from app.config import Settings
@@ -48,6 +48,7 @@ class RiskRejectReason(str, Enum):
     INVALID_SIGNAL = "INVALID_SIGNAL"
     SIZE_TOO_SMALL = "SIZE_TOO_SMALL"
     DISABLED = "DISABLED"
+    CONSISTENCY_RULE = "CONSISTENCY_RULE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,21 +72,40 @@ class RiskManager:
     _realized_today: float = field(default=0.0, init=False)
     _consecutive_losses: int = field(default=0, init=False)
     _disabled: bool = field(default=False, init=False)
+    _trading_start_date: date | None = field(default=None, init=False)
+    _trading_days_counted: int = field(default=0, init=False)
+    _highest_day_pnl: float = field(default=0.0, init=False)
+    _simulated_now: date | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.current_balance <= 0:
             self.current_balance = self.starting_balance
         if self.high_water_mark <= 0:
             self.high_water_mark = self.starting_balance
+        if self._simulated_now is None:
+            self._today = utcnow().date()
+
+    def set_simulated_time(self, dt: datetime) -> None:
+        """Override internal clock for backtesting. Pass candle timestamps."""
+        self._simulated_now = dt.date()
+
+    def _now_date(self) -> date:
+        return self._simulated_now if self._simulated_now is not None else utcnow().date()
 
     # ---- day rollover ---------------------------------------------------
     def _maybe_rollover(self) -> None:
-        today = utcnow().date()
+        today = self._now_date()
         if today != self._today:
             log.info(
                 "risk: day rollover",
                 extra={"prev_day": str(self._today), "trades": self._trades_today, "pnl": self._realized_today},
             )
+            # Count trading days (days that had at least 1 trade)
+            if self._trades_today > 0:
+                self._trading_days_counted += 1
+            # Track highest profitable day (for consistency rule)
+            if self._realized_today > self._highest_day_pnl:
+                self._highest_day_pnl = self._realized_today
             self._today = today
             self._trades_today = 0
             self._realized_today = 0.0
@@ -122,6 +142,14 @@ class RiskManager:
             return RiskDecision(False, 0.0, 0.0, RiskRejectReason.TOTAL_DRAWDOWN,
                                 f"trailing DD {dd_pct:.2%} >= cap")
 
+        # ---- Consistency rule: best day ≤ consistency% of total profit -----
+        total_profit = self.current_balance - self.starting_balance
+        if total_profit > 0 and self._realized_today > self.settings.consistency_pct * total_profit:
+            self._disabled = True
+            return RiskDecision(False, 0.0, 0.0, RiskRejectReason.CONSISTENCY_RULE,
+                                f"today's PnL ${self._realized_today:.2f} exceeds "
+                                f"{self.settings.consistency_pct:.0%} of total profit ${total_profit:.2f}")
+
         if spread_pips is not None and not self.is_spread_acceptable(signal.symbol, spread_pips):
             return RiskDecision(False, 0.0, 0.0, RiskRejectReason.SPREAD_TOO_WIDE,
                                 f"spread {spread_pips:.2f} pips too wide")
@@ -140,6 +168,10 @@ class RiskManager:
         return RiskDecision(True, lots, risk_amount, RiskRejectReason.OK,
                             f"sized {lots} lots, risking ${risk_amount:.2f}")
 
+    def is_min_trading_days_met(self) -> bool:
+        """Check if minimum trading days requirement is satisfied."""
+        return self._trading_days_counted >= self.settings.min_trading_days
+
     def is_spread_acceptable(self, symbol: str, spread_pips: float) -> bool:
         inst = get_instrument(symbol)
         cap = (
@@ -152,6 +184,8 @@ class RiskManager:
     # ---- account updates from execution layer ---------------------------
     def register_trade_open(self) -> None:
         self._maybe_rollover()
+        if self._trading_start_date is None:
+            self._trading_start_date = self._now_date()
         self._trades_today += 1
 
     def register_trade_close(self, trade: Trade) -> None:
@@ -159,6 +193,8 @@ class RiskManager:
         pnl = trade.pnl or 0.0
         self.current_balance += pnl
         self._realized_today += pnl
+        if self._realized_today > self._highest_day_pnl:
+            self._highest_day_pnl = self._realized_today
         self.high_water_mark = max(self.high_water_mark, self.current_balance)
         if trade.status is TradeStatus.CLOSED_LOSS or pnl < 0:
             self._consecutive_losses += 1
@@ -193,6 +229,13 @@ class RiskManager:
             "drawdown_pct": (self.high_water_mark - self.current_balance) / self.high_water_mark
             if self.high_water_mark
             else 0.0,
+            "trading_days_counted": self._trading_days_counted,
+            "min_trading_days": self.settings.min_trading_days,
+            "trading_days_met": self._trading_days_counted >= self.settings.min_trading_days,
+            "trading_start_date": str(self._trading_start_date) if self._trading_start_date else None,
+            "consistency_pct": self.settings.consistency_pct,
+            "consistency_check": f"best day ≤ {self.settings.consistency_pct:.0%} of total profit",
+            "highest_day_pnl": round(self._highest_day_pnl, 2),
         }
 
     # ---- internal -------------------------------------------------------

@@ -31,6 +31,7 @@ class SessionFilter:
     london_close_utc: int
     ny_open_utc: int
     ny_close_utc: int
+    _24h_symbols: tuple[str, ...] = ("BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD")  # 24/7 markets
 
     def classify(self, ts: datetime) -> Session:
         """Return the session that ``ts`` (UTC) falls into."""
@@ -45,5 +46,8 @@ class SessionFilter:
             return Session.NEW_YORK
         return Session.OFF
 
-    def is_active(self, ts: datetime) -> bool:
+    def is_active(self, ts: datetime, symbol: str = "") -> bool:
+        """Return True if session is active, or symbol is a 24/7 market."""
+        if symbol.upper() in self._24h_symbols:
+            return True
         return self.classify(ts) is not Session.OFF

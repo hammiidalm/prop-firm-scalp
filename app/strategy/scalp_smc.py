@@ -1,6 +1,6 @@
 """Smart-Money-Concepts scalping strategy — confluence-scored edition.
 
-This strategy only fires a signal when a **dynamic confluence score ≥ 75 / 100**
+This strategy only fires a signal when a **dynamic confluence score ≥ 60 / 100**
 is achieved.  Every entry must align with the higher-timeframe bias and clear
 five independent filters, each contributing to the total score:
 
@@ -60,7 +60,7 @@ _SCORE_REJECTION: int = 25
 _SCORE_BOS_HTF: int = 20
 _SCORE_ORDER_BLOCK: int = 10
 _SCORE_SESSION_SPREAD: int = 5
-_MIN_CONFLUENCE: int = 75
+_MIN_CONFLUENCE: int = 60
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ class SmcScalpStrategy:
             return None
 
         # ---- Hard-block: outside active session --------------------------
-        if not self.sessions.is_active(candle.timestamp):
+        if not self.sessions.is_active(candle.timestamp, symbol=self.symbol):
             return None
 
         # ---- Hard-block: one signal per bar (de-duplicate live ticks) -----
