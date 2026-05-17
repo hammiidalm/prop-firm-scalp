@@ -143,19 +143,36 @@ class Engine:
             )
             await self._ws.start()
 
-        # 9. REST price poller — always start as fallback / primary data source
-        self._rest_poller = RestPricePoller(
-            symbols=list(s.symbol_timeframe_map.keys()),
-            on_candle=self._on_market_data_from_poller,
-            candle_seconds={
-                sym: Timeframe(tf).to_seconds()
-                for sym, tf in s.symbol_timeframe_map.items()
-            },
-        )
+        # 9. Price data source — Finnhub (preferred) or TradeLocker REST (fallback)
+        use_finnhub = bool(s.finnhub_api_key.get_secret_value())
+
+        if use_finnhub:
+            from app.integrations.finnhub.poller import FinnhubPoller
+
+            log.info("using Finnhub.io as market data source")
+            self._rest_poller = FinnhubPoller(
+                symbols=list(s.symbol_timeframe_map.keys()),
+                on_candle=self._on_market_data_from_poller,
+                candle_seconds={
+                    sym: Timeframe(tf).to_seconds()
+                    for sym, tf in s.symbol_timeframe_map.items()
+                },
+            )
+        else:
+            log.info("using TradeLocker REST as market data source (no FINNHUB_API_KEY)")
+            self._rest_poller = RestPricePoller(
+                symbols=list(s.symbol_timeframe_map.keys()),
+                on_candle=self._on_market_data_from_poller,
+                candle_seconds={
+                    sym: Timeframe(tf).to_seconds()
+                    for sym, tf in s.symbol_timeframe_map.items()
+                },
+            )
+
         try:
             await self._rest_poller.start()
         except Exception as exc:
-            log.warning("rest_poller failed to start, continuing without it: %s", exc)
+            log.warning("price poller failed to start, continuing without it: %s", exc)
             self._rest_poller = None
 
         # 10. Dashboard API (background)
